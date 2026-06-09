@@ -65,7 +65,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional, Sequence, Union
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -107,9 +107,15 @@ try:
     from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
     from lark_oapi.core.model import BaseRequest
     from lark_oapi.event.callback.model.p2_card_action_trigger import (
+        CallBackAction,
         CallBackCard,
+        CallBackToast,
         P2CardActionTriggerResponse,
     )
+    # Accept both string and dict button values (Feishu API spec allows both,
+    # but the SDK model requires Dict).  Prevents 200671 errors.
+    if CallBackAction is not None:
+        CallBackAction._types["value"] = Union[str, Dict[str, Any]]
     from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
     from lark_oapi.ws import Client as FeishuWSClient
 
@@ -117,7 +123,9 @@ try:
 except ImportError:
     FEISHU_AVAILABLE = False
     lark = None  # type: ignore[assignment]
+    CallBackAction = None  # type: ignore[assignment]
     CallBackCard = None  # type: ignore[assignment]
+    CallBackToast = None  # type: ignore[assignment]
     P2CardActionTriggerResponse = None  # type: ignore[assignment]
     EventDispatcherHandler = None  # type: ignore[assignment]
     FeishuWSClient = None  # type: ignore[assignment]
@@ -1369,8 +1377,10 @@ def check_feishu_requirements() -> bool:
         from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
         from lark_oapi.core.model import BaseRequest
         from lark_oapi.event.callback.model.p2_card_action_trigger import (
-            CallBackCard, P2CardActionTriggerResponse,
+            CallBackAction, CallBackCard, CallBackToast, P2CardActionTriggerResponse,
         )
+        if CallBackAction is not None:
+            CallBackAction._types["value"] = Union[str, Dict[str, Any]]
         from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
         from lark_oapi.ws import Client as FeishuWSClient
         return {
@@ -2553,7 +2563,17 @@ class FeishuAdapter(BasePlatformAdapter):
         self._submit_on_loop(loop, self._handle_card_action_event(data))
         if P2CardActionTriggerResponse is None:
             return None
-        return P2CardActionTriggerResponse()
+        # Return a toast to give the user immediate visual feedback,
+        # while the agent processes the action asynchronously in chat.
+        # The card stays intact so multi-button panels remain usable.
+        action_tag = str(getattr(action, "tag", "") or "button")
+        response = P2CardActionTriggerResponse()
+        if CallBackToast is not None:
+            toast = CallBackToast()
+            toast.type = "info"
+            toast.content = f"✅ Received '{action_tag}' action, processing..."
+            response.toast = toast
+        return response
 
     @staticmethod
     def _loop_accepts_callbacks(loop: Any) -> bool:
@@ -2875,13 +2895,13 @@ class FeishuAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-        sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+        sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=str(getattr(operator, "union_id", "") or ""))
         sender_profile = await self._resolve_sender_profile(sender_id)
         chat_info = await self.get_chat_info(chat_id)
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
-            chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type="group"),
+            chat_type=chat_info.get("type") or "group",
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
             thread_id=None,
